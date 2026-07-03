@@ -75,6 +75,8 @@ real time**: open <http://127.0.0.1:7864/> in a browser. It shows the game
 screen (streamed over SSE), the buttons currently held, and a log of every
 tool call plus the cart's `printh` output.
 
+![pico8-mcp live viewer](./pico8-mcp-viewer.png)
+
 - While a browser tab is connected, batched steps are split into small chunks
   (default 15 frames) with a screen grab after each, so long `pico8_step`
   calls play back like a fast-forward video. With no viewer connected there
