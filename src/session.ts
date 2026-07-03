@@ -15,6 +15,19 @@ export interface SessionOptions {
 const isLine = (ev: StreamEvent): ev is Extract<StreamEvent, { type: "line" }> => ev.type === "line";
 const isErrorLine = (l: string) => /(syntax error|runtime error|could not load|unable to load)/i.test(l);
 
+/** Frames per intermediate screen grab when a live viewer is watching. */
+const VIEWER_CHUNK = Math.max(1, parseInt(process.env.PICO8_MCP_VIEWER_CHUNK ?? "15", 10) || 15);
+
+/**
+ * Receiver for intermediate frames during stepping (live viewer).
+ * When `wantsFrames()` is true, `step()` splits batches into small chunks and
+ * pushes a framebuffer snapshot after each one. Costs nothing otherwise.
+ */
+export interface FrameSink {
+  wantsFrames(): boolean;
+  pushFrame(session: Pico8Session, fb: Uint8Array, screenPal: Uint8Array, mask: number): void;
+}
+
 let seq = 0;
 
 export class Pico8Session {
@@ -24,6 +37,10 @@ export class Pico8Session {
   hz = 30;
   frame = 0;
   bootConsole: string[] = [];
+  /** Buttons currently held (mask of the last step). */
+  lastMask = 0;
+  /** Optional live-viewer hook; see FrameSink. */
+  frameSink?: FrameSink;
 
   private readonly bin: string;
   private readonly workDir: string;
@@ -65,6 +82,7 @@ export class Pico8Session {
     this.stderrTail = [];
     this.exitInfo = null;
     this.frame = 0;
+    this.lastMask = 0;
 
     this.proc = spawn(this.bin, ["-home", HOME, "-x", this.injectedPath], {
       stdio: ["pipe", "pipe", "pipe"],
@@ -144,29 +162,40 @@ export class Pico8Session {
   step(mask: number, frames: number): Promise<number> {
     if (frames < 1) throw new Error("frames must be >= 1");
     return this.enqueue(async () => {
+      this.lastMask = mask;
       let left = frames;
       while (left > 0) {
-        const n = Math.min(left, 4095);
+        // when a live viewer is connected, run small chunks and stream a
+        // screen grab after each so the game is watchable as it plays
+        const streaming = this.frameSink?.wantsFrames() ?? false;
+        const n = Math.min(left, streaming ? VIEWER_CHUNK : 4095);
         this.send("f", mask, n);
         await this.waitAck(10000 + n * 20);
         left -= n;
+        if (streaming) {
+          const { screenPal, fb } = await this.fetchScreen();
+          this.frameSink!.pushFrame(this, fb, screenPal, mask);
+        }
       }
       return this.frame;
     });
   }
 
+  /** Raw framebuffer + palette dump; must run inside the command chain. */
+  private async fetchScreen(): Promise<{ screenPal: Uint8Array; fb: Uint8Array }> {
+    this.send("s");
+    const ev = await this.parser.waitFor((e) => e.type === "bin" && e.tag === "fb", 10000, "framebuffer");
+    const data = (ev as Extract<StreamEvent, { type: "bin" }>).data;
+    if (data.length !== 8256) throw new Error(`framebuffer dump: expected 8256 bytes, got ${data.length}`);
+    return {
+      screenPal: new Uint8Array(data.subarray(16, 32)), // 0x5f10..0x5f1f
+      fb: new Uint8Array(data.subarray(64)),
+    };
+  }
+
   /** Dump palette state + framebuffer. */
   screen(): Promise<{ screenPal: Uint8Array; fb: Uint8Array }> {
-    return this.enqueue(async () => {
-      this.send("s");
-      const ev = await this.parser.waitFor((e) => e.type === "bin" && e.tag === "fb", 10000, "framebuffer");
-      const data = (ev as Extract<StreamEvent, { type: "bin" }>).data;
-      if (data.length !== 8256) throw new Error(`framebuffer dump: expected 8256 bytes, got ${data.length}`);
-      return {
-        screenPal: new Uint8Array(data.subarray(16, 32)), // 0x5f10..0x5f1f
-        fb: new Uint8Array(data.subarray(64)),
-      };
-    });
+    return this.enqueue(() => this.fetchScreen());
   }
 
   /** Read global variables by dotted path (e.g. "player.x"). */

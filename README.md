@@ -68,6 +68,30 @@ Claude Desktop and any other MCP host: same command, stdio transport.
 Multiple sessions can run side by side; `session_id` defaults to the most
 recent live one.
 
+## Live viewer
+
+The server hosts a small local web page so you can **watch the LLM play in
+real time**: open <http://127.0.0.1:7864/> in a browser. It shows the game
+screen (streamed over SSE), the buttons currently held, and a log of every
+tool call plus the cart's `printh` output.
+
+- While a browser tab is connected, batched steps are split into small chunks
+  (default 15 frames) with a screen grab after each, so long `pico8_step`
+  calls play back like a fast-forward video. With no viewer connected there
+  is zero overhead.
+- Playback runs at the LLM's pace (usually much faster than real time).
+
+Env knobs:
+
+| Variable | Default | Effect |
+|---|---|---|
+| `PICO8_MCP_VIEWER` | `1` | set to `0` to disable the viewer entirely |
+| `PICO8_MCP_VIEWER_PORT` | `7864` | listen port (binds 127.0.0.1 only) |
+| `PICO8_MCP_VIEWER_CHUNK` | `15` | frames per intermediate screen grab while spectating |
+
+If the port is already in use (e.g. a second MCP host), the viewer is
+disabled with a warning on stderr and the server keeps working normally.
+
 ## Semantics worth knowing
 
 - Buttons stay **held** between steps; `btnp()` fires on the first frame of a

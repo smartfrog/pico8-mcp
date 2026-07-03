@@ -11,11 +11,27 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { Pico8Session, bootCheck } from "./session.js";
+import { Pico8Session, bootCheck, type FrameSink } from "./session.js";
 import { framebufferToPng } from "./png.js";
 import { buttonsToMask, maskToButtons } from "./buttons.js";
+import { startViewer, broadcast, hasClients } from "./viewer.js";
 
 const sessions = new Map<string, Pico8Session>();
+
+/** Streams intermediate frames to the live viewer while stepping. */
+const frameSink: FrameSink = {
+  wantsFrames: () => hasClients(),
+  pushFrame: (s, fb, screenPal, mask) => {
+    broadcast({
+      type: "frame",
+      session: s.id,
+      frame: s.frame,
+      hz: s.hz,
+      buttons: maskToButtons(mask),
+      png: framebufferToPng(fb, screenPal, 1).toString("base64"),
+    });
+  },
+};
 
 function getSession(id?: string): Pico8Session {
   if (id) {
@@ -33,6 +49,7 @@ type Content = { type: "text"; text: string } | { type: "image"; data: string; m
 async function screenshotContent(s: Pico8Session, scale: number): Promise<Content> {
   const { screenPal, fb } = await s.screen();
   const png = framebufferToPng(fb, screenPal, scale);
+  if (hasClients()) frameSink.pushFrame(s, fb, screenPal, s.lastMask);
   return { type: "image", data: png.toString("base64"), mimeType: "image/png" };
 }
 
@@ -43,7 +60,10 @@ function statusText(s: Pico8Session, extra: string[] = []): string {
     ...extra,
   ];
   const console_ = s.alive ? s.drainConsole() : [];
-  if (console_.length) lines.push(`console output:`, ...console_.map((l) => `  ${l}`));
+  if (console_.length) {
+    lines.push(`console output:`, ...console_.map((l) => `  ${l}`));
+    broadcast({ type: "console", session: s.id, lines: console_ });
+  }
   return lines.join("\n");
 }
 
@@ -56,13 +76,31 @@ function errorResult(err: unknown): { content: Content[]; isError: true } {
 
 const server = new McpServer({ name: "pico8-mcp", version: "0.1.0" });
 
+/**
+ * server.registerTool wrapper that broadcasts every call (name, args,
+ * duration, error flag) to the live viewer.
+ */
+type ToolResult = { content: Content[]; isError?: boolean };
+function registerTool(
+  name: string,
+  def: { title: string; description: string; inputSchema: Record<string, z.ZodTypeAny> },
+  handler: (args: any) => Promise<ToolResult>,
+): void {
+  server.registerTool(name, def as never, (async (args: unknown) => {
+    const t0 = Date.now();
+    const res = await handler(args ?? {});
+    broadcast({ type: "tool", name, args: args ?? {}, ms: Date.now() - t0, isError: !!res.isError });
+    return res;
+  }) as never);
+}
+
 const buttonsSchema = z
   .array(z.enum(["left", "right", "up", "down", "o", "x"]))
   .describe('buttons to HOLD during the frames: "o" = btn(4) (usually jump), "x" = btn(5) (usually dash)');
 const scaleSchema = z.number().int().min(1).max(4).default(2).describe("screenshot upscale factor (128*scale px)");
 const sessionIdSchema = z.string().optional().describe("session id; defaults to the most recent live session");
 
-server.registerTool(
+registerTool(
   "pico8_boot",
   {
     title: "Boot a PICO-8 cart",
@@ -81,7 +119,9 @@ server.registerTool(
   async ({ cart_path, seed, screenshot, scale }) => {
     try {
       const s = await Pico8Session.boot(cart_path, { seed });
+      s.frameSink = frameSink;
       sessions.set(s.id, s);
+      broadcast({ type: "status", text: `booted ${cart_path} as session ${s.id} (${s.hz}fps)` });
       const extra = [`booted ${cart_path} (update rate: ${s.hz}fps)`];
       if (s.bootConsole.length) extra.push("boot output:", ...s.bootConsole.map((l) => `  ${l}`));
       const content: Content[] = [{ type: "text", text: statusText(s, extra) }];
@@ -93,7 +133,7 @@ server.registerTool(
   },
 );
 
-server.registerTool(
+registerTool(
   "pico8_step",
   {
     title: "Hold buttons and advance frames",
@@ -124,7 +164,7 @@ server.registerTool(
   },
 );
 
-server.registerTool(
+registerTool(
   "pico8_play",
   {
     title: "Play a scripted input sequence",
@@ -165,7 +205,7 @@ server.registerTool(
   },
 );
 
-server.registerTool(
+registerTool(
   "pico8_screen",
   {
     title: "Screenshot the current frame",
@@ -182,7 +222,7 @@ server.registerTool(
   },
 );
 
-server.registerTool(
+registerTool(
   "pico8_read",
   {
     title: "Read game globals",
@@ -208,7 +248,7 @@ server.registerTool(
   },
 );
 
-server.registerTool(
+registerTool(
   "pico8_peek",
   {
     title: "Read PICO-8 memory",
@@ -241,7 +281,7 @@ server.registerTool(
   },
 );
 
-server.registerTool(
+registerTool(
   "pico8_reset",
   {
     title: "Reset the cart",
@@ -254,6 +294,7 @@ server.registerTool(
     try {
       const s = getSession(session_id);
       await s.reset();
+      broadcast({ type: "status", text: `session ${s.id} reset (cart reloaded from ${s.cartPath})` });
       const content: Content[] = [{ type: "text", text: statusText(s, ["reset: cart reloaded from disk"]) }];
       if (screenshot) content.push(await screenshotContent(s, scale));
       return { content };
@@ -263,7 +304,7 @@ server.registerTool(
   },
 );
 
-server.registerTool(
+registerTool(
   "pico8_shutdown",
   {
     title: "Shut down a session",
@@ -275,6 +316,7 @@ server.registerTool(
       const s = getSession(session_id);
       await s.shutdown();
       sessions.delete(s.id);
+      broadcast({ type: "status", text: `session ${s.id} shut down` });
       return { content: [{ type: "text", text: `session ${s.id} shut down` }] };
     } catch (err) {
       return errorResult(err);
@@ -282,7 +324,7 @@ server.registerTool(
   },
 );
 
-server.registerTool(
+registerTool(
   "pico8_sessions",
   {
     title: "List sessions",
@@ -297,7 +339,7 @@ server.registerTool(
   },
 );
 
-server.registerTool(
+registerTool(
   "pico8_boot_check",
   {
     title: "Plain boot check (no harness)",
@@ -333,6 +375,7 @@ for (const sig of ["SIGINT", "SIGTERM"] as const) {
   });
 }
 
+const viewerUrl = startViewer();
 const transport = new StdioServerTransport();
 await server.connect(transport);
-console.error("pico8-mcp ready (stdio)");
+console.error(`pico8-mcp ready (stdio)${viewerUrl ? ` — live viewer: ${viewerUrl}` : ""}`);
