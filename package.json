@@ -2,6 +2,24 @@
   "name": "pico8-mcp",
   "version": "0.1.0",
   "description": "MCP server for interactive input/output control of PICO-8 carts (lockstep, screenshots, state reading)",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "pico-8",
+    "pico8",
+    "llm",
+    "agent",
+    "game-automation",
+    "tas"
+  ],
+  "homepage": "https://github.com/smartfrog/pico8-mcp#readme",
+  "bugs": {
+    "url": "https://github.com/smartfrog/pico8-mcp/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/smartfrog/pico8-mcp.git"
+  },
   "type": "module",
   "bin": {
     "pico8-mcp": "dist/index.js"
